@@ -18,6 +18,7 @@ procmgr.scrubProcessEnv();
  * CLI entry point — registers all commands explicitly and delegates to the
  * lightweight CLI runner from pi-utils.
  */
+import * as path from "node:path";
 import { type CliConfig, type CommandEntry, run } from "@oh-my-pi/pi-utils/cli";
 
 if (Bun.semver.order(Bun.version, MIN_BUN_VERSION) < 0) {
@@ -27,9 +28,28 @@ if (Bun.semver.order(Bun.version, MIN_BUN_VERSION) < 0) {
 	process.exit(1);
 }
 
-process.title = APP_NAME;
+// Detect known Bun errata that cause TUI crashes (e.g. Bun.stringWidth mishandling OSC sequences).
+if (Bun.stringWidth("\x1b[0m\x1b]8;;\x07") !== 0) {
+	process.stderr.write(`error: Bun runtime errata detected (v${Bun.version}). Please update Bun: bun upgrade\n`);
+	process.exit(1);
+}
+
+const invokedBinName = getInvokedBinName();
+
+function getInvokedBinName(): string {
+	const candidates = [process.argv0, process.argv[1], APP_NAME];
+	for (const candidate of candidates) {
+		if (!candidate) continue;
+		const base = path.basename(candidate);
+		if (!base || base === "bun" || base === "node" || base === "cli.ts") continue;
+		return base;
+	}
+	return APP_NAME;
+}
+process.title = invokedBinName;
 
 const commands: CommandEntry[] = [
+	{ name: "accounts", load: () => import("./commands/accounts").then(m => m.default) },
 	{ name: "launch", load: () => import("./commands/launch").then(m => m.default) },
 	{ name: "acp", load: () => import("./commands/acp").then(m => m.default) },
 	{ name: "auth-broker", load: () => import("./commands/auth-broker").then(m => m.default) },
@@ -101,7 +121,7 @@ export async function runCli(argv: string[]): Promise<void> {
 			: isSubcommand(first)
 				? argv
 				: ["launch", ...argv];
-	return run({ bin: APP_NAME, version: VERSION, argv: runArgv, commands, help: showHelp });
+	return run({ bin: invokedBinName, version: VERSION, argv: runArgv, commands, help: showHelp });
 }
 
 await runCli(process.argv.slice(2));

@@ -229,11 +229,21 @@ export type AgentSessionEvent =
 	| { type: "irc_message"; message: CustomMessage }
 	| { type: "notice"; level: "info" | "warning" | "error"; message: string; source?: string }
 	| { type: "thinking_level_changed"; thinkingLevel: ThinkingLevel | undefined }
-	| { type: "goal_updated"; goal: Goal | null; state?: GoalModeState };
+	| { type: "goal_updated"; goal: Goal | null; state?: GoalModeState }
+	| {
+			type: "credential_switched";
+			provider: string;
+			email?: string;
+			fromProvider?: string;
+			fromEmail?: string;
+	  };
 
 /** Listener function for agent session events */
 export type AgentSessionEventListener = (event: AgentSessionEvent) => void;
-export type AsyncJobSnapshotItem = Pick<AsyncJob, "id" | "type" | "status" | "label" | "startTime">;
+export type AsyncJobSnapshotItem = Pick<
+	AsyncJob,
+	"id" | "type" | "status" | "label" | "startTime" | "currentTool" | "currentToolArgs"
+>;
 
 export interface AsyncJobSnapshot {
 	running: AsyncJobSnapshotItem[];
@@ -793,6 +803,7 @@ export class AgentSession {
 	#retryPromise: Promise<void> | undefined = undefined;
 	#retryResolve: (() => void) | undefined = undefined;
 	#activeRetryFallback: ActiveRetryFallbackState | undefined = undefined;
+	#hasRetriedTasks = false;
 	// Todo completion reminder state
 	#todoReminderCount = 0;
 	#todoPhases: TodoPhase[] = [];
@@ -1257,6 +1268,8 @@ export class AgentSession {
 			status: job.status,
 			label: job.label,
 			startTime: job.startTime,
+			currentTool: job.currentTool,
+			currentToolArgs: job.currentToolArgs,
 		}));
 		const recent = manager.getRecentJobs(options?.recentLimit ?? 5, ownerFilter).map(job => ({
 			id: job.id,
@@ -1264,6 +1277,8 @@ export class AgentSession {
 			status: job.status,
 			label: job.label,
 			startTime: job.startTime,
+			currentTool: job.currentTool,
+			currentToolArgs: job.currentToolArgs,
 		}));
 		const delivery = manager.getDeliveryState(ownerFilter);
 		return { running, recent, delivery };
@@ -4749,6 +4764,46 @@ export class AgentSession {
 	}
 
 	/**
+	 * Whether the session can be resumed (last assistant message was aborted or errored,
+	 * and no streaming or retry is in progress).
+	 */
+	canResume(): boolean {
+		if (this.isStreaming || this.isRetrying) return false;
+		const last = this.#findLastAssistantMessage();
+		if (!last) return false;
+		return last.stopReason === "aborted" || last.stopReason === "error";
+	}
+
+	/**
+	 * Resume from an aborted or errored state by stripping the failed assistant
+	 * message (and its placeholder tool results) and re-entering the agent loop.
+	 */
+	resume(): void {
+		if (!this.canResume()) return;
+
+		const messages = this.agent.state.messages;
+		let removeFrom = messages.length;
+		for (let i = messages.length - 1; i >= 0; i--) {
+			const msg = messages[i];
+			if (msg.role === "assistant" && (msg.stopReason === "aborted" || msg.stopReason === "error")) {
+				removeFrom = i;
+				break;
+			}
+			if (msg.role === "toolResult") {
+				continue;
+			}
+			break;
+		}
+		this.agent.replaceMessages(messages.slice(0, removeFrom));
+
+		if (this.#retryAttempt > 0) {
+			this.#retryAttempt = 0;
+		}
+
+		void this.agent.continue().catch(() => {});
+	}
+
+	/**
 	 * Start a new session, optionally with initial messages and parent tracking.
 	 * Clears all messages and starts a new session.
 	 * Listeners are preserved and will continue receiving events.
@@ -7077,18 +7132,29 @@ export class AgentSession {
 		let switchedModel = false;
 
 		if (this.model && isUsageLimitError(errorMessage)) {
+			const providerName = this.model.provider;
+			const authStorage = this.#modelRegistry.authStorage;
+			let fromEmail: string | undefined;
+			const status = authStorage.getAccountStatus(providerName, this.sessionId);
+			if (status) {
+				const activeAccount = authStorage.getAccountInfos(providerName)[status.activeIndex];
+				if (activeAccount?.credential.type === "oauth") {
+					fromEmail = activeAccount.credential.email;
+				}
+			}
 			const retryAfterMs = parsedRetryAfterMs ?? calculateRateLimitBackoffMs(parseRateLimitReason(errorMessage));
-			const switched = await this.#modelRegistry.authStorage.markUsageLimitReached(
-				this.model.provider,
-				this.sessionId,
-				{
-					retryAfterMs,
-					baseUrl: this.model.baseUrl,
-				},
-			);
+			const switched = await authStorage.markUsageLimitReached(providerName, this.sessionId, {
+				retryAfterMs,
+				baseUrl: this.model.baseUrl,
+			});
 			if (switched) {
 				switchedCredential = true;
-				delayMs = 0;
+				delayMs = 1000;
+				await this.#emitSessionEvent({
+					type: "credential_switched",
+					provider: providerName,
+					fromEmail,
+				});
 			} else if (retryAfterMs > delayMs) {
 				// No more accounts to switch to — wait out the backoff
 				delayMs = retryAfterMs;
@@ -7100,7 +7166,7 @@ export class AgentSession {
 			this.#noteRetryFallbackCooldown(currentSelector, parsedRetryAfterMs, errorMessage);
 			switchedModel = await this.#tryRetryModelFallback(currentSelector);
 			if (switchedModel) {
-				delayMs = 0;
+				delayMs = 1000;
 			} else if (parsedRetryAfterMs && parsedRetryAfterMs > delayMs) {
 				delayMs = parsedRetryAfterMs;
 			}
@@ -8629,5 +8695,67 @@ export class AgentSession {
 	 */
 	get extensionRunner(): ExtensionRunner | undefined {
 		return this.#extensionRunner;
+	}
+
+	async retryFailedTasks(): Promise<{
+		count: number;
+		info: Array<{ id: string; tokens: number; toolCount: number; lastTool?: string; description?: string }>;
+	} | null> {
+		const taskTool = this.#toolRegistry.get("task") as
+			| {
+					failedTasks?: readonly {
+						id: string;
+						tokens: number;
+						toolCount: number;
+						lastTool?: string;
+						description?: string;
+					}[];
+					retry?: (onUpdate?: (status: string) => void) => Promise<{ summary: string } | null>;
+					recoverFailedTasksFromHistory?: (messages: AgentMessage[]) => Promise<void>;
+			  }
+			| undefined;
+		if (!taskTool?.retry) return null;
+
+		if (
+			(!taskTool.failedTasks || taskTool.failedTasks.length === 0) &&
+			taskTool.recoverFailedTasksFromHistory &&
+			!this.#hasRetriedTasks
+		) {
+			await taskTool.recoverFailedTasksFromHistory(this.agent.state.messages);
+		}
+
+		if (!taskTool.failedTasks?.length) return null;
+
+		const info = taskTool.failedTasks.map(t => ({
+			id: t.id,
+			tokens: t.tokens,
+			toolCount: t.toolCount,
+			lastTool: t.lastTool,
+			description: t.description,
+		}));
+		const count = info.length;
+		this.#hasRetriedTasks = true;
+
+		void taskTool
+			.retry(status => {
+				logger.debug("Task retry progress", { status });
+			})
+			.then(result => {
+				if (result) {
+					const message = `<retried-task-results>\n${result.summary}\n</retried-task-results>`;
+					void this.followUp(message);
+				}
+			});
+
+		return { count, info };
+	}
+
+	async recoverFailedTasks(): Promise<void> {
+		const taskTool = this.#toolRegistry.get("task") as
+			| { recoverFailedTasksFromHistory?: (messages: AgentMessage[]) => Promise<void> }
+			| undefined;
+		if (taskTool?.recoverFailedTasksFromHistory) {
+			await taskTool.recoverFailedTasksFromHistory(this.agent.state.messages);
+		}
 	}
 }

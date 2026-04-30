@@ -101,6 +101,7 @@ import {
 import { AgentSession } from "./session/agent-session";
 import { resolveAuthBrokerConfig } from "./session/auth-broker-config";
 import { AuthBrokerClient, AuthStorage, RemoteAuthCredentialStore } from "./session/auth-storage";
+import { materializeMessages } from "./session/content-store";
 import { convertToLlm } from "./session/messages";
 import { SessionManager } from "./session/session-manager";
 import { closeAllConnections } from "./ssh/connection-manager";
@@ -731,6 +732,9 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			"options.authStorage and options.modelRegistry.authStorage must be the same instance when both are provided",
 		);
 	}
+	// Keep OAuth refresh-token sliding windows alive while the session runs.
+	// Without this, providers like Anthropic expire tokens overnight and force re-login.
+	authStorage.startProactiveRefresh();
 	// Subscribe before any getApiKey() call so startup model probes can't fire a
 	// credential_disabled event past us. An embedder's constructor handler makes the
 	// listener set non-empty from construction, which defeats AuthStorage's no-listener
@@ -1726,9 +1730,14 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			});
 		};
 
-		// Final convertToLlm: chain block-images filter with secret obfuscation
-		const convertToLlmFinal = (messages: AgentMessage[]): Message[] => {
-			const converted = convertToLlmWithBlockImages(messages);
+		// Final convertToLlm: rehydrate cold tool-result text from the content store,
+		// then chain the block-images filter with secret obfuscation. Rehydration is
+		// the single chokepoint before providers see messages, so any code path
+		// (main loop, subagent, compaction) ends up with fully materialized content.
+		const contentStore = sessionManager.contentStore;
+		const convertToLlmFinal = async (messages: AgentMessage[]): Promise<Message[]> => {
+			const warm = await materializeMessages(messages, contentStore);
+			const converted = convertToLlmWithBlockImages(warm);
 			if (!obfuscator?.hasSecrets()) return converted;
 			return obfuscateMessages(obfuscator, converted);
 		};

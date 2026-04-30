@@ -1,6 +1,10 @@
 import { INTENT_FIELD } from "@oh-my-pi/pi-agent-core";
 import { calculatePromptTokens } from "@oh-my-pi/pi-agent-core/compaction/compaction";
-import type { AssistantMessage, ImageContent } from "@oh-my-pi/pi-ai";
+import {
+	type AssistantMessage,
+	type ImageContent,
+	isRetryableError as isTransportRetryableError,
+} from "@oh-my-pi/pi-ai";
 import { type Component, Loader, TERMINAL, Text } from "@oh-my-pi/pi-tui";
 import { settings } from "../../config/settings";
 import { AssistantMessageComponent } from "../../modes/components/assistant-message";
@@ -63,6 +67,7 @@ export class EventController {
 			todo_auto_clear: e => this.#handleTodoAutoClear(e),
 			irc_message: e => this.#handleIrcMessage(e),
 			notice: e => this.#handleNotice(e),
+			credential_switched: e => this.#handleCredentialSwitched(e),
 			thinking_level_changed: async () => {},
 			goal_updated: async () => {},
 		} satisfies AgentSessionEventHandlers;
@@ -395,6 +400,12 @@ export class EventController {
 						: "Operation aborted";
 				this.ctx.streamingMessage.errorMessage = errorMessage;
 			}
+			if (this.ctx.streamingMessage.stopReason === "error" && this.ctx.streamingMessage.errorMessage) {
+				const msg = this.ctx.streamingMessage.errorMessage;
+				if (isTransportRetryableError(new Error(msg))) {
+					this.ctx.streamingMessage.errorMessage = `${msg} \u2014 Enter to resume`;
+				}
+			}
 			if (silentlyAborted || ttsrSilenced) {
 				// Silence the streaming render by downgrading stopReason to "stop" for
 				// display only — does NOT mutate the persisted message's stopReason
@@ -708,6 +719,17 @@ export class EventController {
 
 	async #handleTodoAutoClear(_event: Extract<AgentSessionEvent, { type: "todo_auto_clear" }>): Promise<void> {
 		await this.ctx.reloadTodos();
+	}
+
+	async #handleCredentialSwitched(event: Extract<AgentSessionEvent, { type: "credential_switched" }>): Promise<void> {
+		if (event.fromProvider) {
+			this.ctx.showStatus(`All ${event.fromProvider} accounts rate-limited, falling back to ${event.provider}`);
+		} else {
+			const account = event.fromEmail ?? event.provider;
+			this.ctx.showStatus(`Rate limited ${account}, switching to next account`);
+		}
+		this.ctx.statusLine.invalidate();
+		this.ctx.ui.requestRender();
 	}
 
 	#cancelIdleCompaction(): void {

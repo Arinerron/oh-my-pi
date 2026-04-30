@@ -281,7 +281,14 @@ export class EvalTool implements AgentTool<typeof evalSchema> {
 				}
 				session.assertEvalExecutionAllowed?.();
 
-				const tailBuffer = new TailBuffer(DEFAULT_MAX_BYTES * 2);
+				const maxOutputBytes = session.settings.get("bash.maxOutputBytes");
+				const effectiveMaxBytes =
+					maxOutputBytes != null && maxOutputBytes > 0
+						? maxOutputBytes
+						: maxOutputBytes === 0
+							? Number.MAX_SAFE_INTEGER
+							: DEFAULT_MAX_BYTES;
+				const tailBuffer = new TailBuffer(effectiveMaxBytes * 2);
 				const jsonOutputs: unknown[] = [];
 				const images: ImageContent[] = [];
 				const statusEvents: EvalStatusEvent[] = [];

@@ -91,6 +91,23 @@ function extractAccountFromTokenResponse(data: AnthropicTokenResponse): {
 	};
 }
 
+const PROFILE_URL = "https://api.anthropic.com/api/oauth/profile";
+
+interface ClaudeProfile {
+	account?: { uuid?: string; email?: string };
+}
+
+async function fetchProfile(accessToken: string): Promise<ClaudeProfile | null> {
+	try {
+		const res = await fetch(PROFILE_URL, {
+			headers: { Authorization: `Bearer ${accessToken}` },
+		});
+		if (!res.ok) return null;
+		return (await res.json()) as ClaudeProfile;
+	} catch {
+		return null;
+	}
+}
 export class AnthropicOAuthFlow extends OAuthCallbackFlow {
 	#verifier: string = "";
 	#challenge: string = "";
@@ -154,12 +171,14 @@ export class AnthropicOAuthFlow extends OAuthCallbackFlow {
 		const tokenData = parseOAuthTokenResponse(responseBody, "token exchange");
 		const { accountId, email } = extractAccountFromTokenResponse(tokenData);
 
+		const profile = await fetchProfile(tokenData.access_token);
+
 		return {
 			refresh: tokenData.refresh_token,
 			access: tokenData.access_token,
 			expires: Date.now() + tokenData.expires_in * 1000 - 5 * 60 * 1000,
-			accountId,
-			email,
+			accountId: accountId ?? profile?.account?.uuid,
+			email: email ?? profile?.account?.email,
 		};
 	}
 }
@@ -190,11 +209,14 @@ export async function refreshAnthropicToken(refreshToken: string): Promise<OAuth
 	const data = parseOAuthTokenResponse(responseBody, "token refresh");
 	const { accountId, email } = extractAccountFromTokenResponse(data);
 
+	const accessToken = data.access_token;
+	const profile = await fetchProfile(accessToken);
+
 	return {
 		refresh: data.refresh_token || refreshToken,
-		access: data.access_token,
+		access: accessToken,
 		expires: Date.now() + data.expires_in * 1000 - 5 * 60 * 1000,
-		accountId,
-		email,
+		accountId: accountId ?? profile?.account?.uuid,
+		email: email ?? profile?.account?.email,
 	};
 }

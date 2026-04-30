@@ -78,6 +78,14 @@ export interface StoredAuthCredential {
 	disabledCause: string | null;
 }
 
+export interface AccountInfo {
+	id: number;
+	provider: string;
+	credential: AuthCredential;
+	blocked: boolean;
+	blockedUntil?: number;
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Auth Broker Snapshot Types
 // ─────────────────────────────────────────────────────────────────────────────
@@ -565,6 +573,7 @@ export class AuthStorage {
 	#generationListeners: Set<(generation: number) => void> = new Set();
 	#oauthRefreshInFlight: Map<number, Promise<AuthCredentialSnapshotEntry>> = new Map();
 	#closed = false;
+	#proactiveRefreshTimer?: NodeJS.Timeout;
 
 	constructor(store: AuthCredentialStore, options: AuthStorageOptions = {}) {
 		this.#store = store;
@@ -607,6 +616,7 @@ export class AuthStorage {
 	 */
 	close(): void {
 		if (this.#closed) return;
+		this.stopProactiveRefresh();
 		this.#closed = true;
 		this.#store.close();
 	}
@@ -668,6 +678,85 @@ export class AuthStorage {
 		return () => {
 			this.#credentialDisabledListeners.delete(listener);
 		};
+	}
+
+	/**
+	 * Start a background timer that proactively refreshes OAuth credentials before
+	 * they expire. This keeps refresh-token sliding windows alive across idle periods.
+	 *
+	 * Anthropic (and potentially other providers) issue refresh tokens with a sliding
+	 * expiry — each successful refresh extends the lifetime. Without proactive refresh,
+	 * tokens go stale between user sessions (e.g., overnight) and force a re-login.
+	 *
+	 * @param intervalMs - How often to scan for expiring credentials (default: 10 min)
+	 * @param refreshAheadMs - Refresh credentials expiring within this window (default: 15 min)
+	 */
+	startProactiveRefresh(intervalMs = 10 * 60_000, refreshAheadMs = 15 * 60_000): void {
+		this.stopProactiveRefresh();
+		this.#proactiveRefreshTimer = setInterval(() => {
+			void this.#runProactiveRefresh(refreshAheadMs);
+		}, intervalMs);
+		// Don't prevent the process from exiting due to this background timer.
+		this.#proactiveRefreshTimer.unref();
+		// Run once immediately so tokens expiring soon are caught on startup.
+		void this.#runProactiveRefresh(refreshAheadMs);
+	}
+
+	/**
+	 * Stop the proactive refresh timer.
+	 */
+	stopProactiveRefresh(): void {
+		if (this.#proactiveRefreshTimer) {
+			clearInterval(this.#proactiveRefreshTimer);
+			this.#proactiveRefreshTimer = undefined;
+		}
+	}
+
+	async #runProactiveRefresh(refreshAheadMs: number): Promise<void> {
+		const now = Date.now();
+		for (const [provider, entries] of this.#data) {
+			for (let index = 0; index < entries.length; index++) {
+				const { credential } = entries[index];
+				if (credential.type !== "oauth") continue;
+				// Already far from expiry — skip.
+				if (credential.expires > now + refreshAheadMs) continue;
+				try {
+					// Call refreshOAuthToken directly instead of #refreshOAuthCredential,
+					// because the latter short-circuits when the access token hasn't expired
+					// yet. Proactive refresh must refresh BEFORE expiry to keep the
+					// provider's refresh-token sliding window alive.
+					const customProvider = getOAuthProvider(provider);
+					let refreshed: OAuthCredentials;
+					if (customProvider) {
+						if (!customProvider.refreshToken) continue;
+						refreshed = await customProvider.refreshToken(credential);
+					} else {
+						refreshed = await refreshOAuthToken(provider as OAuthProvider, credential);
+					}
+					// Only persist when something actually changed.
+					if (refreshed.access !== credential.access || refreshed.refresh !== credential.refresh) {
+						const updated: OAuthCredential = {
+							type: "oauth",
+							access: refreshed.access,
+							refresh: refreshed.refresh,
+							expires: refreshed.expires,
+							accountId: refreshed.accountId ?? credential.accountId,
+							email: refreshed.email ?? credential.email,
+							projectId: refreshed.projectId ?? credential.projectId,
+							enterpriseUrl: refreshed.enterpriseUrl ?? credential.enterpriseUrl,
+						};
+						this.#replaceCredentialAt(provider, index, updated);
+						logger.debug("Proactive token refresh succeeded", { provider, index });
+					}
+				} catch (error) {
+					logger.debug("Proactive token refresh failed", {
+						provider,
+						index,
+						error: String(error),
+					});
+				}
+			}
+		}
 	}
 
 	/**
@@ -834,6 +923,23 @@ export class AuthStorage {
 			}
 			this.#resetProviderAssignments(provider);
 		}
+
+		// Second pass: prune null-identity OAuth credentials when a credential with
+		// identity exists for the same provider. This handles the migration from
+		// credentials stored before identity info was available.
+		if (seen.size > 0) {
+			const pruned: StoredCredential[] = [];
+			for (const entry of kept) {
+				if (entry.credential.type === "oauth" && !this.#resolveOAuthDedupeIdentityKey(provider, entry.credential)) {
+					this.#store.deleteAuthCredential(entry.id, "superseded by credential with identity");
+					this.#resetProviderAssignments(provider);
+				} else {
+					pruned.push(entry);
+				}
+			}
+			return pruned.reverse();
+		}
+
 		return kept.reverse();
 	}
 
@@ -2328,7 +2434,16 @@ export class AuthStorage {
 						...refreshedCredentials,
 						type: "oauth",
 					};
-				} catch {}
+					this.#replaceCredentialAt(provider, candidate.selection.index, candidate.selection.credential);
+				} catch {
+					// Refresh failed — check if a concurrent caller already succeeded.
+					// Without this, we'd pass a stale refresh token to #tryOAuthCredential,
+					// which would fail again and permanently disable the credential.
+					const updated = this.#getCredentialsForProvider(provider)[candidate.selection.index];
+					if (updated?.type === "oauth" && Date.now() < updated.expires) {
+						candidate.selection.credential = updated;
+					}
+				}
 			}),
 		);
 
@@ -2913,6 +3028,27 @@ export class AuthStorage {
 	}
 
 	/**
+	 * Get account info for all credentials of a provider.
+	 */
+	getAccountInfos(provider: string): AccountInfo[] {
+		const stored = this.#getStoredCredentials(provider);
+		const now = Date.now();
+		return stored.map((entry, index) => {
+			const providerKey = this.#getProviderTypeKey(provider, entry.credential.type);
+			const backoffMap = this.#credentialBackoff.get(providerKey);
+			const blockedUntil = backoffMap?.get(index);
+			const blocked = blockedUntil !== undefined && blockedUntil > now;
+			return {
+				id: entry.id,
+				provider,
+				credential: entry.credential,
+				blocked,
+				blockedUntil: blocked ? blockedUntil : undefined,
+			};
+		});
+	}
+
+	/**
 	 * Describe where the active credential for a provider came from.
 	 *
 	 * Surfaces four layers, highest precedence first:
@@ -2959,6 +3095,46 @@ export class AuthStorage {
 				: `cred ${chosen.id}`;
 		return `${baseLabel} · ${preferredType} #${chosen.id} (${identity})`;
 	}
+
+	/**
+	 * Returns the active credential index for a session, plus total count and active count.
+	 * Returns undefined if the provider has 0 or 1 credentials (no switching possible).
+	 */
+	getAccountStatus(
+		provider: string,
+		sessionId?: string,
+	): { activeIndex: number; total: number; active: number } | undefined {
+		const credentials = this.#getCredentialsForProvider(provider);
+		if (credentials.length <= 1) return undefined;
+		const sessionCred = this.#getSessionCredential(provider, sessionId);
+		const activeIndex = sessionCred?.index ?? 0;
+		let active = 0;
+		for (let i = 0; i < credentials.length; i++) {
+			const cred = credentials[i];
+			if (cred.type === "oauth") {
+				const oauth = cred as OAuthCredential;
+				if (oauth.expires && oauth.expires < Date.now()) continue;
+			}
+			const providerKey = this.#getProviderTypeKey(provider, cred.type);
+			if (!this.#isCredentialBlocked(providerKey, i)) {
+				active++;
+			}
+		}
+		return { activeIndex, total: credentials.length, active };
+	}
+
+	/**
+	 * Force the active credential for a provider/session to a specific index.
+	 * Returns true if the switch was applied.
+	 */
+	setActiveAccount(provider: string, sessionId: string | undefined, credentialIndex: number): boolean {
+		if (!sessionId) return false;
+		const credentials = this.#getCredentialsForProvider(provider);
+		if (credentialIndex < 0 || credentialIndex >= credentials.length) return false;
+		const cred = credentials[credentialIndex];
+		this.#recordSessionCredential(provider, sessionId, cred.type, credentialIndex);
+		return true;
+	}
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -2981,7 +3157,7 @@ type SerializedCredentialRecord = {
 	identityKey: string | null;
 };
 
-const AUTH_SCHEMA_VERSION = 4;
+const AUTH_SCHEMA_VERSION = 5;
 const SQLITE_NOW_EPOCH = "CAST(strftime('%s','now') AS INTEGER)";
 
 function normalizeStoredAccountId(accountId: string | null | undefined): string | null {
@@ -3331,6 +3507,9 @@ export class SqliteAuthCredentialStore implements AuthCredentialStore {
 		if (fromVersion < 4) {
 			this.#migrateAuthSchemaV3ToV4();
 		}
+		if (fromVersion < 5) {
+			this.#migrateAuthSchemaV4ToV5();
+		}
 	}
 
 	#migrateAuthSchemaV0ToV1(): void {
@@ -3407,6 +3586,32 @@ export class SqliteAuthCredentialStore implements AuthCredentialStore {
 				FROM auth_credentials_v3
 			`);
 			this.#db.run("DROP TABLE auth_credentials_v3");
+		});
+		migrate();
+	}
+
+	#migrateAuthSchemaV4ToV5(): void {
+		const migrate = this.#db.transaction(() => {
+			// 1. Hard-delete all disabled (soft-deleted) credentials.
+			//    These are zombie rows from failed refreshes (e.g., invalid_grant)
+			//    that can never be used again.
+			this.#db.exec("DELETE FROM auth_credentials WHERE disabled_cause IS NOT NULL");
+
+			// 2. Remove null-identity OAuth duplicates per provider.
+			//    Before profile-fetch was added, Anthropic OAuth credentials were stored
+			//    without email/accountId, so identity_key was NULL. Each login created
+			//    a new row instead of updating the existing one. Now that new logins
+			//    populate identity, prune the stale null-identity rows when a credential
+			//    with identity exists for the same provider.
+			this.#db.exec(`
+				DELETE FROM auth_credentials
+				WHERE identity_key IS NULL
+					AND credential_type = 'oauth'
+					AND provider IN (
+						SELECT DISTINCT provider FROM auth_credentials
+						WHERE identity_key IS NOT NULL AND disabled_cause IS NULL
+					)
+			`);
 		});
 		migrate();
 	}
@@ -3514,6 +3719,18 @@ export class SqliteAuthCredentialStore implements AuthCredentialStore {
 					continue;
 				}
 				this.#deleteStmt.run("replaced by newer credential", row.id);
+			}
+
+			if (targetId === null && serialized.identityKey) {
+				// Fallback: if the incoming credential has identity but no existing credential matched,
+				// check for a single null-identity credential of the same type. This handles the
+				// migration case where a credential was stored before identity info was available
+				// (e.g., Anthropic OAuth before profile fetch was added).
+				const nullIdentityRows = existing.filter(row => row.credential?.type === item.type && !row.identityKey);
+				if (nullIdentityRows.length === 1) {
+					targetId = nullIdentityRows[0].id;
+					this.#updateStmt.run(serialized.credentialType, serialized.data, serialized.identityKey, targetId);
+				}
 			}
 
 			if (targetId === null) {

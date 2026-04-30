@@ -18,6 +18,7 @@ import type { HistoryStorage } from "../session/history-storage";
 import type { SessionContext, SessionManager } from "../session/session-manager";
 import type { LspStartupServerInfo } from "../tools";
 import type { AssistantMessageComponent } from "./components/assistant-message";
+import type { BackgroundTaskRunsComponent } from "./components/background-task-runs";
 import type { BashExecutionComponent } from "./components/bash-execution";
 import type { CustomEditor } from "./components/custom-editor";
 import type { EvalExecutionComponent } from "./components/eval-execution";
@@ -64,6 +65,8 @@ export interface InteractiveModeContext {
 	chatContainer: Container;
 	pendingMessagesContainer: Container;
 	statusContainer: Container;
+	backgroundTaskRunsContainer: Container;
+	backgroundTaskRunsComponent: BackgroundTaskRunsComponent;
 	todoContainer: Container;
 	btwContainer: Container;
 	editor: CustomEditor;
@@ -248,6 +251,7 @@ export interface InteractiveModeContext {
 	showDebugSelector(): void;
 	showSessionObserver(): void;
 	resetObserverRegistry(): void;
+	showAccountsSelector(): void;
 
 	// Input handling
 	handleCtrlC(): void;

@@ -312,6 +312,7 @@ impl From<CoreBashFixupResult> for BashFixupResult {
 pub fn apply_bash_fixups(command: String) -> BashFixupResult {
 	core_apply_bash_fixups(&command).into()
 }
+}
 
 #[cfg(test)]
 mod tests {
