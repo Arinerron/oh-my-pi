@@ -6,7 +6,7 @@ import * as z from "zod/v4";
 import { type AsyncJob, AsyncJobManager, isBackgroundJobSupportEnabled } from "../async";
 import type { RenderResultOptions } from "../extensibility/custom-tools/types";
 import type { Theme } from "../modes/theme/theme";
-import jobDescription from "../prompts/tools/job.md" with { type: "text" };
+import jobDescriptionTemplate from "../prompts/tools/job.md" with { type: "text" };
 import { Ellipsis, Hasher, type RenderCache, renderStatusLine, renderTreeList, truncateToWidth } from "../tui";
 import type { ToolSession } from "./index";
 import {
@@ -25,6 +25,11 @@ import { ToolError } from "./tool-errors";
 const jobSchema = z.object({
 	poll: z.array(z.string()).optional().describe("job ids to wait for"),
 	cancel: z.array(z.string()).optional().describe("job ids to cancel"),
+	list: z.boolean().optional().describe("snapshot all jobs"),
+});
+
+const jobSchemaPollOnly = z.object({
+	poll: z.array(z.string()).optional().describe("job ids to wait for"),
 	list: z.boolean().optional().describe("snapshot all jobs"),
 });
 
@@ -65,16 +70,23 @@ export interface JobToolDetails {
 	cancelled?: { id: string; status: CancelStatus }[];
 }
 
-export class JobTool implements AgentTool<typeof jobSchema, JobToolDetails> {
+export class JobTool implements AgentTool<typeof jobSchema | typeof jobSchemaPollOnly, JobToolDetails> {
 	readonly name = "job";
 	readonly label = "Job";
 	readonly summary = "Manage long-running background jobs (async bash/python)";
-	readonly description: string;
-	readonly parameters = jobSchema;
 	readonly strict = true;
 	readonly loadMode = "discoverable";
-	constructor(private readonly session: ToolSession) {
-		this.description = prompt.render(jobDescription);
+
+	constructor(private readonly session: ToolSession) {}
+
+	get description(): string {
+		const allowCancel = this.session.settings.get("async.allowCancel");
+		return prompt.render(jobDescriptionTemplate, { allowCancel });
+	}
+
+	get parameters() {
+		const allowCancel = this.session.settings.get("async.allowCancel");
+		return allowCancel ? jobSchema : jobSchemaPollOnly;
 	}
 
 	static createIf(session: ToolSession): JobTool | null {
@@ -84,11 +96,12 @@ export class JobTool implements AgentTool<typeof jobSchema, JobToolDetails> {
 
 	async execute(
 		_toolCallId: string,
-		params: JobParams,
+		rawParams: unknown,
 		signal?: AbortSignal,
 		onUpdate?: AgentToolUpdateCallback<JobToolDetails>,
 		_context?: AgentToolContext,
 	): Promise<AgentToolResult<JobToolDetails>> {
+		const params = rawParams as JobParams;
 		const manager = AsyncJobManager.instance();
 		if (!manager) {
 			return {
@@ -110,7 +123,19 @@ export class JobTool implements AgentTool<typeof jobSchema, JobToolDetails> {
 			return this.#buildResult(manager, manager.getAllJobs(ownerFilter), []);
 		}
 
-		const cancelIds = params.cancel ?? [];
+		const allowCancel = this.session.settings.get("async.allowCancel");
+		const cancelIds = allowCancel ? (params.cancel ?? []) : [];
+		if (!allowCancel && params.cancel?.length) {
+			return {
+				content: [
+					{
+						type: "text",
+						text: "Job cancellation is disabled. Change the async.allowCancel setting to enable it.",
+					},
+				],
+				details: { jobs: [] },
+			};
+		}
 		const cancelOutcomes: CancelOutcome[] = [];
 		for (const id of cancelIds) {
 			const existing = manager.getJob(id);
