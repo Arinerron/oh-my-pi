@@ -2,9 +2,9 @@ import type { AgentMessage } from "@oh-my-pi/pi-agent-core";
 import {
 	type AssistantMessage,
 	type ImageContent,
-	isRetryableError as isTransportRetryableError,
 	type Message,
 } from "@oh-my-pi/pi-ai";
+import { isRetryableError as isTransportRetryableError } from "@oh-my-pi/pi-utils";
 import { type Component, Spacer, Text, TruncatedText } from "@oh-my-pi/pi-tui";
 import { settings } from "../../config/settings";
 import { AssistantMessageComponent } from "../../modes/components/assistant-message";

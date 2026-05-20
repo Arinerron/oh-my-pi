@@ -3,8 +3,8 @@ import { calculatePromptTokens } from "@oh-my-pi/pi-agent-core/compaction/compac
 import {
 	type AssistantMessage,
 	type ImageContent,
-	isRetryableError as isTransportRetryableError,
 } from "@oh-my-pi/pi-ai";
+import { isRetryableError as isTransportRetryableError } from "@oh-my-pi/pi-utils";
 import { type Component, Loader, TERMINAL, Text } from "@oh-my-pi/pi-tui";
 import { settings } from "../../config/settings";
 import { AssistantMessageComponent } from "../../modes/components/assistant-message";
