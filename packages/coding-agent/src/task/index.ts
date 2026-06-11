@@ -1321,7 +1321,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 							continue;
 						}
 					}
-					const matchingTask = tasksWithContext.find(t => t.id === result.id);
+					const matchingTask = tasksWithUniqueIds.find(t => t.id === result.id);
 					this.#failedTasks.push({
 						id: result.id,
 						agent: result.agent,
