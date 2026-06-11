@@ -1568,7 +1568,7 @@ const BUILTIN_SLASH_COMMAND_REGISTRY: ReadonlyArray<SlashCommandSpec> = [
 		description: "Set terminal title (clear with no args)",
 		inlineHint: "[title text]",
 		allowArgs: true,
-		handle: (_command, runtime) => {
+		handleTui: (_command, runtime) => {
 			runtime.ctx.editor.setText("");
 			const titleArg = _command.args?.trim() ?? "";
 			if (!titleArg) {
@@ -1584,7 +1584,7 @@ const BUILTIN_SLASH_COMMAND_REGISTRY: ReadonlyArray<SlashCommandSpec> = [
 	{
 		name: "retry",
 		description: "Retry failed or cancelled background tasks",
-		handle: async (_command, runtime) => {
+		handleTui: async (_command, runtime) => {
 			runtime.ctx.editor.setText("");
 			const result = await runtime.ctx.session.retryFailedTasks?.();
 			if (!result) {
@@ -1604,7 +1604,7 @@ const BUILTIN_SLASH_COMMAND_REGISTRY: ReadonlyArray<SlashCommandSpec> = [
 		name: "switch",
 		aliases: ["account", "accounts"],
 		description: "Switch active account for current provider",
-		handle: async (_command, runtime) => {
+		handleTui: async (_command, runtime) => {
 			runtime.ctx.editor.setText("");
 			runtime.ctx.showAccountsSelector?.();
 		},
