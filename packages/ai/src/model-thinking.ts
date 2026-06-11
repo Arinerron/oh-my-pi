@@ -39,8 +39,13 @@ type SemVer = {
 };
 
 type GeminiKind = "pro" | "flash";
-type AnthropicKind = "opus" | "sonnet";
+type AnthropicKind = "opus" | "sonnet" | "fable" | "mythos";
 type OpenAIVariant = "base" | "codex" | "codex-max" | "codex-mini" | "codex-spark" | "mini" | "max" | "nano";
+
+/** Fable/Mythos are Opus-tier: same API restrictions, effort levels, and thinking behavior. */
+function isOpusTier(kind: AnthropicKind): boolean {
+	return kind === "opus" || kind === "fable" || kind === "mythos";
+}
 
 const CODEX_GPT_5_4_PRIORITY_BY_VARIANT: Partial<Record<OpenAIVariant, number>> = {
 	base: 0,
@@ -314,13 +319,13 @@ export function mapEffortToAnthropicAdaptiveEffort<TApi extends Api>(
 export function hasOpus47ApiRestrictions(modelId: string): boolean {
 	const parsed = parseAnthropicModel(getCanonicalModelId(modelId));
 	if (!parsed) return false;
-	return semverGte(parsed.version, "4.7") && parsed.kind === "opus";
+	return isOpusTier(parsed.kind) && semverGte(parsed.version, "4.7");
 }
 
 function anthropicModelHasRealXHighEffort<TApi extends Api>(model: ApiModel<TApi>): boolean {
 	if (model.api !== "anthropic-messages") return false;
 	const parsedModel = parseKnownModel(model.id);
-	if (parsedModel.family !== "anthropic" || parsedModel.kind !== "opus") return false;
+	if (parsedModel.family !== "anthropic" || !isOpusTier(parsedModel.kind)) return false;
 	return semverGte(parsedModel.version, "4.7");
 }
 
@@ -516,7 +521,7 @@ function inferAnthropicSupportedEfforts<TApi extends Api>(
 		(model.api === "anthropic-messages" || model.api === "bedrock-converse-stream") &&
 		semverGte(parsedModel.version, "4.6")
 	) {
-		return parsedModel.kind === "opus" ? DEFAULT_REASONING_EFFORTS_WITH_XHIGH : DEFAULT_REASONING_EFFORTS;
+		return isOpusTier(parsedModel.kind) ? DEFAULT_REASONING_EFFORTS_WITH_XHIGH : DEFAULT_REASONING_EFFORTS;
 	}
 	return inferFallbackEfforts(model);
 }
@@ -572,7 +577,7 @@ function inferThinkingControlMode<TApi extends Api>(
 
 		case "bedrock-converse-stream":
 			if (parsedModel.family === "anthropic") {
-				if (semverGte(parsedModel.version, "4.6") && parsedModel.kind === "opus") {
+				if (semverGte(parsedModel.version, "4.6") && isOpusTier(parsedModel.kind)) {
 					return "anthropic-adaptive";
 				}
 				if (semverGte(parsedModel.version, "4.5")) {
@@ -612,7 +617,7 @@ function parseGeminiModel(modelId: string): GeminiModel | null {
 }
 
 function parseAnthropicModel(modelId: string): AnthropicModel | null {
-	const match = /claude-(opus|sonnet)-(\d{1,2}(?:[.-]\d{1,2}){0,2})\b/.exec(modelId);
+	const match = /claude-(opus|sonnet|fable|mythos)-(\d{1,2}(?:[.-]\d{1,2}){0,2})\b/.exec(modelId);
 	if (!match) {
 		return null;
 	}

@@ -216,6 +216,8 @@ let warnedStopSequencesTrim = false;
  * Older adaptive-thinking models (Opus 4.6, Sonnet 4.6+) reject the field.
  */
 function supportsAdaptiveThinkingDisplay(modelId: string): boolean {
+	// Fable/Mythos always support display; Opus supports it from 4.7+.
+	if (/claude-(fable|mythos)-\d/.test(modelId)) return true;
 	const match = /claude-opus-(\d+)-(\d+)/.exec(modelId);
 	if (!match) return false;
 	const major = Number(match[1]);
